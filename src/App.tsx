@@ -1,0 +1,442 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect } from 'react';
+import { 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  signInWithPopup, 
+  signOut, 
+  onAuthStateChanged,
+  User
+} from 'firebase/auth';
+import { doc, setDoc, getDoc, serverTimestamp } from 'firebase/firestore';
+import { auth, db, googleProvider } from './firebase';
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import * as z from 'zod';
+import { 
+  Mail, 
+  Lock, 
+  User as UserIcon, 
+  LogOut, 
+  Github, 
+  Chrome, 
+  AlertCircle,
+  Loader2,
+  CheckCircle2
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+
+// --- Types & Schemas ---
+
+const loginSchema = z.object({
+  email: z.string().email('Invalid email address'),
+  password: z.string().min(6, 'Password must be at least 6 characters'),
+});
+
+const registerSchema = z.object({
+  email: z.string().email('Invalid email address'),
+  password: z.string().min(6, 'Password must be at least 6 characters'),
+  confirmPassword: z.string().min(6, 'Confirm password must be at least 6 characters'),
+}).refine((data) => data.password === data.confirmPassword, {
+  message: "Passwords don't match",
+  path: ["confirmPassword"],
+});
+
+type LoginFormValues = z.infer<typeof loginSchema>;
+type RegisterFormValues = z.infer<typeof registerSchema>;
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+// --- Error Handling ---
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+// --- Components ---
+
+class ErrorBoundary extends React.Component<any, any> {
+  state = { hasError: false, error: null };
+
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      let errorMessage = "Something went wrong.";
+      try {
+        const parsed = JSON.parse(this.state.error?.message || "{}");
+        if (parsed.error) errorMessage = parsed.error;
+      } catch {
+        errorMessage = this.state.error?.message || errorMessage;
+      }
+
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-gray-50 p-4">
+          <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 text-center">
+            <AlertCircle className="w-16 h-16 text-red-500 mx-auto mb-4" />
+            <h2 className="text-2xl font-bold text-gray-900 mb-2">Application Error</h2>
+            <p className="text-gray-600 mb-6">{errorMessage}</p>
+            <button 
+              onClick={() => window.location.reload()}
+              className="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg transition-colors"
+            >
+              Reload Application
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return (this as any).props.children;
+  }
+}
+
+const AuthForm = () => {
+  const [isLogin, setIsLogin] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const { register, handleSubmit, formState: { errors }, reset } = useForm<any>({
+    resolver: zodResolver(isLogin ? loginSchema : registerSchema),
+  });
+
+  const onSubmit = async (data: any) => {
+    setLoading(true);
+    setError(null);
+    try {
+      if (isLogin) {
+        await signInWithEmailAndPassword(auth, data.email, data.password);
+      } else {
+        const userCredential = await createUserWithEmailAndPassword(auth, data.email, data.password);
+        const user = userCredential.user;
+        
+        // Create user profile in Firestore
+        const userRef = doc(db, 'users', user.uid);
+        try {
+          await setDoc(userRef, {
+            uid: user.uid,
+            email: user.email,
+            displayName: user.displayName || user.email?.split('@')[0],
+            photoURL: user.photoURL || `https://api.dicebear.com/7.x/avataaars/svg?seed=${user.uid}`,
+            createdAt: serverTimestamp(),
+          });
+        } catch (err) {
+          handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
+        }
+      }
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await signInWithPopup(auth, googleProvider);
+      const user = result.user;
+      
+      // Check if user profile exists, if not create it
+      const userRef = doc(db, 'users', user.uid);
+      const userSnap = await getDoc(userRef);
+      
+      if (!userSnap.exists()) {
+        try {
+          await setDoc(userRef, {
+            uid: user.uid,
+            email: user.email,
+            displayName: user.displayName,
+            photoURL: user.photoURL,
+            createdAt: serverTimestamp(),
+          });
+        } catch (err) {
+          handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
+        }
+      }
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <motion.div 
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="max-w-md w-full bg-white rounded-3xl shadow-2xl overflow-hidden border border-gray-100"
+    >
+      <div className="p-8">
+        <div className="text-center mb-8">
+          <h2 className="text-3xl font-bold text-gray-900 tracking-tight">
+            {isLogin ? 'Welcome Back' : 'Create Account'}
+          </h2>
+          <p className="text-gray-500 mt-2">
+            {isLogin ? 'Sign in to access your portal' : 'Join us to get started'}
+          </p>
+        </div>
+
+        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Email Address</label>
+            <div className="relative">
+              <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+              <input
+                {...register('email')}
+                type="email"
+                className="w-full pl-10 pr-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none transition-all"
+                placeholder="name@example.com"
+              />
+            </div>
+            {errors.email && <p className="text-red-500 text-xs mt-1 ml-1">{errors.email.message}</p>}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
+            <div className="relative">
+              <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+              <input
+                {...register('password')}
+                type="password"
+                className="w-full pl-10 pr-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none transition-all"
+                placeholder="••••••••"
+              />
+            </div>
+            {errors.password && <p className="text-red-500 text-xs mt-1 ml-1">{errors.password.message}</p>}
+          </div>
+
+          {!isLogin && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Confirm Password</label>
+              <div className="relative">
+                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+                <input
+                  {...register('confirmPassword')}
+                  type="password"
+                  className="w-full pl-10 pr-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none transition-all"
+                  placeholder="••••••••"
+                />
+              </div>
+              {errors.confirmPassword && <p className="text-red-500 text-xs mt-1 ml-1">{errors.confirmPassword.message}</p>}
+            </div>
+          )}
+
+          {error && (
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="p-3 bg-red-50 border border-red-100 rounded-xl flex items-center gap-2 text-red-600 text-sm"
+            >
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>{error}</span>
+            </motion.div>
+          )}
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-xl shadow-lg shadow-indigo-200 transition-all flex items-center justify-center gap-2 disabled:opacity-70"
+          >
+            {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : (isLogin ? 'Sign In' : 'Sign Up')}
+          </button>
+        </form>
+
+        <div className="relative my-8">
+          <div className="absolute inset-0 flex items-center">
+            <div className="w-full border-t border-gray-200"></div>
+          </div>
+          <div className="relative flex justify-center text-sm">
+            <span className="px-2 bg-white text-gray-500">Or continue with</span>
+          </div>
+        </div>
+
+        <button
+          onClick={handleGoogleSignIn}
+          disabled={loading}
+          className="w-full py-3 px-4 bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 font-semibold rounded-xl transition-all flex items-center justify-center gap-3"
+        >
+          <Chrome className="w-5 h-5 text-red-500" />
+          Google
+        </button>
+
+        <p className="text-center mt-8 text-sm text-gray-600">
+          {isLogin ? "Don't have an account? " : "Already have an account? "}
+          <button
+            onClick={() => {
+              setIsLogin(!isLogin);
+              setError(null);
+              reset();
+            }}
+            className="text-indigo-600 font-semibold hover:underline"
+          >
+            {isLogin ? 'Sign Up' : 'Sign In'}
+          </button>
+        </p>
+      </div>
+    </motion.div>
+  );
+};
+
+const UserDashboard = ({ user }: any) => {
+  const [profile, setProfile] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchProfile = async () => {
+      try {
+        const userRef = doc(db, 'users', user.uid);
+        const userSnap = await getDoc(userRef);
+        if (userSnap.exists()) {
+          setProfile(userSnap.data());
+        }
+      } catch (err) {
+        console.error("Error fetching profile:", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchProfile();
+  }, [user.uid]);
+
+  return (
+    <motion.div 
+      initial={{ opacity: 0, scale: 0.95 }}
+      animate={{ opacity: 1, scale: 1 }}
+      className="max-w-2xl w-full bg-white rounded-3xl shadow-2xl overflow-hidden border border-gray-100"
+    >
+      <div className="p-8">
+        <div className="flex flex-col items-center text-center mb-8">
+          <div className="relative mb-4">
+            <img 
+              src={profile?.photoURL || user.photoURL || `https://api.dicebear.com/7.x/avataaars/svg?seed=${user.uid}`} 
+              alt="Profile" 
+              className="w-24 h-24 rounded-full border-4 border-indigo-50 shadow-lg object-cover"
+              referrerPolicy="no-referrer"
+            />
+            <div className="absolute bottom-0 right-0 bg-green-500 border-2 border-white w-6 h-6 rounded-full"></div>
+          </div>
+          <h2 className="text-2xl font-bold text-gray-900">{profile?.displayName || user.displayName || 'User'}</h2>
+          <p className="text-gray-500">{user.email}</p>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+          <div className="p-4 bg-indigo-50 rounded-2xl">
+            <p className="text-xs font-semibold text-indigo-600 uppercase tracking-wider mb-1">User ID</p>
+            <p className="text-sm font-mono text-indigo-900 truncate">{user.uid}</p>
+          </div>
+          <div className="p-4 bg-green-50 rounded-2xl">
+            <p className="text-xs font-semibold text-green-600 uppercase tracking-wider mb-1">Status</p>
+            <div className="flex items-center gap-2 text-green-900">
+              <CheckCircle2 className="w-4 h-4" />
+              <span className="text-sm font-medium">Authenticated</span>
+            </div>
+          </div>
+        </div>
+
+        <button
+          onClick={() => signOut(auth)}
+          className="w-full py-3 px-4 bg-gray-900 hover:bg-black text-white font-semibold rounded-xl transition-all flex items-center justify-center gap-2"
+        >
+          <LogOut className="w-5 h-5" />
+          Sign Out
+        </button>
+      </div>
+    </motion.div>
+  );
+};
+
+export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [initializing, setInitializing] = useState(true);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setUser(user);
+      setInitializing(false);
+    });
+    return unsubscribe;
+  }, []);
+
+  if (initializing) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <Loader2 className="w-10 h-10 text-indigo-600 animate-spin" />
+      </div>
+    );
+  }
+
+  return (
+    <ErrorBoundary>
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-4 font-sans">
+        <AnimatePresence mode="wait">
+          {!user ? (
+            <AuthForm key="auth" />
+          ) : (
+            <UserDashboard key="dashboard" user={user} />
+          )}
+        </AnimatePresence>
+        
+        <footer className="mt-8 text-gray-400 text-sm">
+          Secure Auth Portal &bull; Powered by Firebase
+        </footer>
+      </div>
+    </ErrorBoundary>
+  );
+}

@@ -1,0 +1,5 @@
+{
+  "name": "Secure Auth Portal",
+  "description": "A simple authentication portal with email/password and Google login, built with Firebase.",
+  "requestFramePermissions": []
+}
